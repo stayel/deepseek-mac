@@ -51,8 +51,8 @@
     const osPlatform = isWindows ? "Windows (PowerShell)" : "macOS (Zsh)";
 
     const SYSTEM_PROMPT = `【系统协议：本地 ${osPlatform} Agent 闭环模式已激活】
-你是 DeepSeek Agent（第六位本地 Agent），拥有控制本机的执行权限。
-开工第一步：先用 local_cmd 读你的灵魂文件 \`C:/Users/Admin/Documents/ObsidianVault/02-System-Rules/Agent-Soul.md\`，读完简短确认，之后一切按它行事（它是你唯一的长效记忆契约，会话重启即失忆）。
+你是用户在本机的专属 Agent，拥有执行命令与读写文件的权限，始终用中文回复。
+开工第一步：先用 local_cmd 执行 hostname 与 pwd，确认身份与工作目录后简短报告，然后等待用户指令。
 
 【你有的能力】（每轮只输出一个代码块，真实结果会自动回来）：
 \`\`\`local_cmd
@@ -80,29 +80,70 @@
     // Send throttling + rate-limit backoff: the site rejects burst sends
     // ("Messages too frequent"), which wedges the loop (request leaves but
     // the message is refused). Floor the send rate, detect refusal, cool
-    // down, then retry once automatically.
-    const MIN_SEND_GAP_MS = 8000;
+    // down, then retry once automatically (second strike auto-pauses, see
+    // enterBackoff).
+    // Human-like send pacing (anti-ban): every send rolls a fresh irregular
+    // "read + think" gap instead of a fixed machine interval. Only actual
+    // HTTP sends are server-visible, so this gate is the stealth control
+    // surface; local timers (polls/debounce) are deliberately untouched.
+    const MIN_SEND_GAP_MS = 15000;
+    const MAX_SEND_GAP_MS = 35000;
+    let nextSendGapMs = MIN_SEND_GAP_MS + Math.random() * (MAX_SEND_GAP_MS - MIN_SEND_GAP_MS);
     const BACKOFF_MS = 90000;
     let lastAutoSendAt = 0;
     let rateLimitBackoffUntil = 0;
     let lastRateLimitHandledAt = 0;
     let lastFeedbackForRetry = { text: '', at: 0 };
     let backoffRetried = false;
+    let rateLimitHits = 0;
+    // Continuous-work fuse: after FUSE_MAX_STREAK straight auto sends, force
+    // a "coffee break" so long sessions don't look like a bot loop.
+    // Toggling 自动执行 off->on clears the fuse early (manual override).
+    const FUSE_MAX_STREAK = 15;
+    let autoSendStreak = 0;
+    let fuseUntil = 0;
+    let lastGapHudSec = -1;
     function queueFeedbackSlot(fn) {
         feedbackChain = feedbackChain.then(() => new Promise(resolve => {
             const start = Date.now();
             const iv = setInterval(() => {
                 let proceed = false;
                 try {
+                    // Fuse trip check: streak reached the cap -> schedule a
+                    // random 3~8 min coffee break instead of sending on.
+                    if (autoSendStreak >= FUSE_MAX_STREAK && fuseUntil <= Date.now()) {
+                        fuseUntil = Date.now() + (3 * 60 + Math.random() * 5 * 60) * 1000;
+                        autoSendStreak = 0;
+                        try { console.log('[Agent Bridge] Fuse tripped: coffee break until ' + new Date(fuseUntil).toLocaleTimeString()); } catch (_) {}
+                    }
                     const lastAck = window.__lastCompletionAt || 0;
-                    const gapOk = Date.now() - lastAutoSendAt >= MIN_SEND_GAP_MS;
+                    const gapOk = Date.now() - lastAutoSendAt >= nextSendGapMs;
                     const coolOk = Date.now() >= rateLimitBackoffUntil;
-                    if (prevAcked && gapOk && coolOk) proceed = true;
-                    else if (!prevAcked && prevSendAt > 0 && lastAck >= prevSendAt && gapOk && coolOk) proceed = true;
-                    else if (Date.now() - start > 30000) proceed = true;
+                    const fuseOk = Date.now() >= fuseUntil;
+                    if (prevAcked && gapOk && coolOk && fuseOk) proceed = true;
+                    else if (!prevAcked && prevSendAt > 0 && lastAck >= prevSendAt && gapOk && coolOk && fuseOk) proceed = true;
+                    else if (Date.now() - start > 120000) proceed = true;
+                    else {
+                        // Human-readable wait state (throttled to 1s changes)
+                        // so long irregular gaps don't look like a hang.
+                        let waitMs = 0, label = '';
+                        if (!fuseOk) { waitMs = fuseUntil - Date.now(); label = '连续工作' + FUSE_MAX_STREAK + '轮，休息中…约'; }
+                        else if (!coolOk) { waitMs = rateLimitBackoffUntil - Date.now(); label = '限流冷却中…约'; }
+                        else if (!gapOk) { waitMs = (lastAutoSendAt + nextSendGapMs) - Date.now(); label = '思考中…约'; }
+                        if (waitMs > 0) {
+                            const sec = Math.ceil(waitMs / 1000);
+                            if (sec !== lastGapHudSec) { lastGapHudSec = sec; updateHUD(label + sec + 's后发送', '#2563eb'); }
+                        }
+                    }
                 } catch (_) { proceed = true; }
                 if (proceed) {
                     clearInterval(iv);
+                    try {
+                        // Re-roll the human gap for the NEXT round + streak++.
+                        nextSendGapMs = MIN_SEND_GAP_MS + Math.random() * (MAX_SEND_GAP_MS - MIN_SEND_GAP_MS);
+                        autoSendStreak++;
+                        lastGapHudSec = -1;
+                    } catch (_) {}
                     prevSendAt = Date.now();
                     prevAcked = false;
                     try { window.__lastSendAt = prevSendAt; hideGlobal('__lastSendAt'); } catch (_) {}
@@ -247,6 +288,8 @@
         const toggleBtn = document.getElementById('agent-toggle-btn');
         toggleBtn.addEventListener('click', () => {
             autoExecute = !autoExecute;
+            // Manual override: re-enabling clears fuse + strike counter.
+            try { if (autoExecute) { fuseUntil = 0; autoSendStreak = 0; rateLimitHits = 0; lastGapHudSec = -1; } } catch (_) {}
             toggleBtn.textContent = autoExecute ? "自动执行: 开" : "自动执行: 暂停";
             toggleBtn.style.color = autoExecute ? "#334155" : "#ef4444";
             updateHUD(autoExecute ? "Tool Call 引擎就绪" : "已暂停自动执行", autoExecute ? "#10b981" : "#f59e0b");
@@ -1296,7 +1339,11 @@ ${output}
 \`\`\`
 (注：附件未能挂载显示，已转纯文本反馈，请继续。若需继续执行请输出 \`\`\`local_cmd 代码块，若完成请直接解答。)`;
 
-            let countdown = (isAttachment && fileObj) ? 1 : 2;
+            // Human-like pre-send pause, re-rolled every round (the pacing
+            // bar already displays the value, so the UI stays truthful).
+            let countdown = (isAttachment && fileObj)
+                ? (2 + Math.floor(Math.random() * 3))
+                : (3 + Math.floor(Math.random() * 5));
             if (controller) {
                 controller.showPacing(countdown, () => {
                     if (pendingFeedbackTimer) clearTimeout(pendingFeedbackTimer);
@@ -1886,24 +1933,47 @@ ${output}
         try {
             rateLimitBackoffUntil = Date.now() + BACKOFF_MS;
             backoffRetried = false;
+            rateLimitHits++;
             try { diagAttach({ phase: 'rate-limit', source: source, detail: (detail || '').slice(0, 120) }); } catch (_) {}
-            updateHUD('发送过于频繁，冷却90秒后自动重试…', '#f59e0b');
-            console.error('[Agent Bridge] rate limited (' + source + '), backing off 90s');
+            if (rateLimitHits >= 2) {
+                // Second strike: stop the loop and wait for a human.
+                // Hammering through explicit rate limits is the fastest
+                // path to an account ban; manual resume required.
+                autoExecute = false;
+                try {
+                    const tb = document.getElementById('agent-toggle-btn');
+                    if (tb) { tb.textContent = "自动执行: 暂停"; tb.style.color = "#ef4444"; }
+                } catch (_) {}
+                updateHUD('多次撞限流，已自动暂停，冷却后点"自动执行"手动恢复', '#ef4444');
+                console.error('[Agent Bridge] rate limited x' + rateLimitHits + ' — auto-paused, manual resume required');
+            } else {
+                updateHUD('发送过于频繁，冷却90秒后自动重试…', '#f59e0b');
+                console.error('[Agent Bridge] rate limited (' + source + '), backing off 90s');
+            }
         } catch (_) {}
     }
     setInterval(() => {
         try {
             if (rateLimitBackoffUntil > 0) {
                 if (Date.now() < rateLimitBackoffUntil) return; // still cooling
-                // Expired: retry once, then clear and resume.
+                // Expired: retry once, then clear and resume — but never
+                // against an explicit pause (e.g. second-strike auto-pause).
                 rateLimitBackoffUntil = 0;
-                if (!backoffRetried && lastFeedbackForRetry.text &&
+                if (autoExecute && !backoffRetried && lastFeedbackForRetry.text &&
                     Date.now() - lastFeedbackForRetry.at < 10 * 60 * 1000) {
                     backoffRetried = true;
-                    updateHUD('冷却结束，重发上一条反馈…', '#2563eb');
+                    updateHUD('冷却结束，稍后重发上一条反馈…', '#2563eb');
                     try { diagAttach({ phase: 'rate-limit-retry' }); } catch (_) {}
-                    injectPrompt(lastFeedbackForRetry.text, true);
-                    burstCollapse();
+                    // Small extra irregular delay so the retry doesn't fire
+                    // the exact millisecond the cooldown expires.
+                    const retryDelay = 5000 + Math.random() * 10000;
+                    setTimeout(() => {
+                        try {
+                            if (!autoExecute) return;
+                            injectPrompt(lastFeedbackForRetry.text, true);
+                            burstCollapse();
+                        } catch (_) {}
+                    }, retryDelay);
                 }
                 return;
             }
