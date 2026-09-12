@@ -103,6 +103,11 @@
     let autoSendStreak = 0;
     let fuseUntil = 0;
     let lastGapHudSec = -1;
+    // Session hygiene (anti-ban): very long single sessions (hundreds of
+    // auto sends) are themselves a bot signal. Remind every N sends to
+    // rotate to a fresh chat. Counter resets on Ctrl+I re-injection.
+    const SESSION_REMIND_EVERY = 30;
+    let totalSessionSends = 0;
     function queueFeedbackSlot(fn) {
         feedbackChain = feedbackChain.then(() => new Promise(resolve => {
             const start = Date.now();
@@ -122,7 +127,10 @@
                     const fuseOk = Date.now() >= fuseUntil;
                     if (prevAcked && gapOk && coolOk && fuseOk) proceed = true;
                     else if (!prevAcked && prevSendAt > 0 && lastAck >= prevSendAt && gapOk && coolOk && fuseOk) proceed = true;
-                    else if (Date.now() - start > 120000) proceed = true;
+                    else if (Date.now() - start > 120000 && coolOk && fuseOk) proceed = true;
+                    // NOTE: the stall escape hatch above must NEVER bypass
+                    // fuse/cooling — otherwise long coffee breaks (3~8 min)
+                    // would always be cut short at 120s.
                     else {
                         // Human-readable wait state (throttled to 1s changes)
                         // so long irregular gaps don't look like a hang.
@@ -143,6 +151,14 @@
                         nextSendGapMs = MIN_SEND_GAP_MS + Math.random() * (MAX_SEND_GAP_MS - MIN_SEND_GAP_MS);
                         autoSendStreak++;
                         lastGapHudSec = -1;
+                        totalSessionSends++;
+                        if (totalSessionSends % SESSION_REMIND_EVERY === 0) {
+                            const smsg = '本会话已自动发送' + totalSessionSends + '条：建议 Ctrl+N 开新会话后重按 Ctrl+I（超长会话易触发风控）';
+                            try { console.error('[Agent Bridge] ' + smsg); } catch (_) {}
+                            // Delay past the "同步执行结果" status so the
+                            // reminder is what stays visible afterwards.
+                            try { setTimeout(() => { try { updateHUD(smsg, '#7c3aed'); } catch (_) {} }, 1600); } catch (_) {}
+                        }
                     } catch (_) {}
                     prevSendAt = Date.now();
                     prevAcked = false;
@@ -1211,6 +1227,9 @@
             return insertTextAtCursor(text);
         },
         injectSystemPrompt: function() {
+            // Fresh protocol injection ≈ fresh session intent: restart the
+            // session-length counter (and clear fuse/strikes, see toggle).
+            try { totalSessionSends = 0; fuseUntil = 0; autoSendStreak = 0; rateLimitHits = 0; lastGapHudSec = -1; } catch (_) {}
             injectPrompt(SYSTEM_PROMPT, true);
         },
         dumpConversation: function() {
@@ -1664,7 +1683,10 @@ ${output}
                 try { done(false); } catch (_) {}
                 return;
             }
-            if (tick % 4 === 0) {
+            // Sparse retry (anti-ban): re-click at most ~every 2s, ~3 tries
+            // in the 6s window. Rapid-fire clicks risk duplicate sends that
+            // the server sees as a burst.
+            if (tick % 10 === 0) {
                 try { triggerSend(); clicks++; } catch (_) {}
             }
         }, 200);
