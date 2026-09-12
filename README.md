@@ -15,7 +15,7 @@
   - **极速代码生成**：支持 `agy-run`（基于 Gemini 3.8 Flash Low，无思考损耗，极速纯代码输出）。
 - **零额外 API 费用**：完全基于官方 Web 端，免去商业 API 计量计费。
 - **防频控与交互降噪**：
-  - **智能节流（Anti-Rate-Limit）**：内置 3 秒自动节流倒计时，防止频繁触发网页端「Messages too frequent」限制。
+  - **人类化 pacing（Anti-Ban）**：发送间隔每轮重掷 15~35 秒"思考"间隙，执行前 3~7 秒倒计时并如实显示；连续工作 15 轮强制休息 3~8 分钟；二次撞限流自动暂停待人工恢复；单会话 30 轮提醒开新会话。
   - **原生卡片化 UI**：在聊天窗口直接渲染高颜值 Tool Call 卡片，实时展现终端执行状态与输出。
   - **反馈自动折叠**：自动将长终端反馈折叠为紧凑胶囊，保持聊天界面整洁有序。
 
@@ -26,7 +26,7 @@
 | 平台 | 宿主技术栈 | 网页渲染内核 | 终端执行底座 | 安装包体积 |
 | :--- | :--- | :--- | :--- | :--- |
 | **macOS** | Swift 6 + AppKit | 系统内置 `WKWebView` | `/bin/zsh -l -c` | **~500 KB** |
-| **Windows** | C# (.NET 8 WPF) | 系统内置 Edge `CoreWebView2` | `powershell.exe -EncodedCommand` | **~3 MB** |
+| **Windows** | C# (.NET 8 WPF) | 系统内置 Edge `CoreWebView2` | `powershell.exe -EncodedCommand` | **约 50 MB（多文件目录版）** |
 
 两端共享同一个高度优化的前端闭环注入引擎 [`agent_bridge.js`](agent_bridge.js)，自动识别当前操作系统并适配对应的提示词与交互协议。
 
@@ -96,7 +96,7 @@
    cd windows
    .\build.ps1
    ```
-   构建完成后在 `windows/publish/` 生成单文件可执行程序 `DeepSeek.exe`。
+    构建完成后在 `windows/publish/` 生成多文件可执行程序 `DeepSeek.exe`（约 50 MB，`publish` 目录已被 `.gitignore` 排除，需本地构建）。
 
 ---
 
@@ -131,6 +131,16 @@
 5. App 自动在本地终端运行该命令，回传结果，DeepSeek 继续下一步，直到全部完成！
 
 ---
+
+## 🍴 Fork 说明（stayel）
+
+本仓库 fork 自 [moxiuren/deepseek-mac](https://github.com/moxiuren/deepseek-mac)（基于 v1.0.4），本地化改动如下，详见 commit 历史：
+
+- **注入协议去个人化**：移除原作者私有的灵魂文件路径依赖，开工改为 `hostname + pwd` 自检（`agent_bridge.js`）。
+- **人类化 pacing（Anti-Ban）**：发送间隔随机化、连续工作熔断、二次撞限流自动暂停、会话轮数提醒（`agent_bridge.js`）。
+- 上游更新时本 fork 以 rebase 方式同步。
+
+原项目 LICENSE 与版权归属不变，见下。
 
 ## 📄 License
 
