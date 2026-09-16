@@ -56,12 +56,12 @@
 
 【你有的能力】（每轮只输出一个代码块，真实结果会自动回来）：
 \`\`\`local_cmd
-<PowerShell 命令> 或 agy -p "<完整无歧义指令>" --model gemini-3.8-flash-low --effort low --dangerously-skip-permissions
+<PowerShell 命令>
 \`\`\`
 \`\`\`write_file:目标路径
 文件内容
 \`\`\`
-（查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
+（查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。
 【搜索纪律】：禁裸扫全盘——用户目录根/盘符根/注册表递归必须带 -Depth（≤3），先 Desktop/Documents/Projects，禁 AppData；护栏会直接打回无 -Depth 的裸扫；确需全量加注释 #scan-ok。
