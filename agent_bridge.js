@@ -61,7 +61,7 @@
 \`\`\`write_file:目标路径
 文件内容
 \`\`\`
-（查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；截屏用 agent-screenshot，挂大文件用 agent-attach。）
+（查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 且只用相对路径（禁绝对路径，含空格路径会解析失败）；必须用绝对路径时改走 local_cmd 用 PowerShell 创建；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。
 【搜索纪律】：禁裸扫全盘——用户目录根/盘符根/注册表递归必须带 -Depth（≤3），先 Desktop/Documents/Projects，禁 AppData；护栏会直接打回无 -Depth 的裸扫；确需全量加注释 #scan-ok。
