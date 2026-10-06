@@ -54,6 +54,14 @@
 你是用户在本机的专属 Agent，拥有执行命令与读写文件的权限，始终用中文回复。
 开工第一步：先用 local_cmd 执行 hostname 与 pwd，确认身份与工作目录后简短报告，然后等待用户指令。
 
+【单动作铁律（最高优先级，违反会导致你的命令被丢弃）】
+一轮回复里**只能有一个代码块，且块内只做一件事**。这是硬约束，不是建议：
+- 不要在一轮里给两个及以上代码块。桥接器一轮只执行第一个，你为其余命令永远等不到结果。
+- 不要把多件事塞进一个块：既写文件又跑命令、一条命令里用 ; 或换行串起"读取+修改+删除"、一次改多个文件，都算多动作。
+- 想连做 5 件事：发第 1 件 → 等真实结果 → 再发第 2 件 → 等结果 → …… 一件一件来。宁可多轮，不要合并。
+- 步骤多时先给一句话纯文本计划（不含代码块），等用户确认后再逐步执行。
+- 如果你已经发了一轮多块，不要重发；按桥接器返回的结果顺序往下走。
+
 【你有的能力】（每轮只输出一个代码块，真实结果会自动回来）：
 \`\`\`local_cmd
 <PowerShell 命令>
@@ -64,7 +72,7 @@
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 且只用相对路径（禁绝对路径，含空格路径会解析失败）；必须用绝对路径时改走 local_cmd 用 PowerShell 创建；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。
-【配对自检】：每条工具结果都带 #序号 与 CMD/PATH 回显。若回来的结果与你的命令不符（序号跳号、CMD 对不上、内容像是更早一次的输出），直接说明"这与我的命令不符"并要求重跑，不要顺着这个结果往下推断。
+【配对自检】：每条工具结果都带 #序号 与 CMD/PATH 回显。若回来的结果与你的命令不符（序号跳号、CMD 对不上、内容像是更早一次的输出），直接说明"这与我的命令不符"并要求重跑，不要顺着这个结果往下推断。若等了很久没有任何结果回来，说明你的块被判为历史/重复而没有执行，把**同一条命令单独重发一次**（一次一块）。
 【搜索纪律】：禁裸扫全盘——用户目录根/盘符根/注册表递归必须带 -Depth（≤3），先 Desktop/Documents/Projects，禁 AppData；护栏会直接打回无 -Depth 的裸扫；确需全量加注释 #scan-ok。
 请确认收到，并等待用户指令。`;
 
@@ -171,11 +179,110 @@
         }));
         return feedbackChain;
     }
+    function orderFeedbackQueue() {
+        feedbackQueue.sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    }
+    function enqueueFeedback(item) {
+        feedbackQueue.push(item);
+        orderFeedbackQueue();
+        try { console.log('[Feedback] seq=' + (item.seq || '?') + ' enqueued, queue=' + feedbackQueue.length); } catch (_) {}
+        if (!feedbackDryRun) drainFeedbackQueue();
+    }
+    function drainFeedbackQueue() {
+        if (feedbackDraining || !feedbackQueue.length) return;
+        if (feedbackDryRun) {
+            // Test mode: synchronous drain, no pacing gate, nothing injected.
+            let guard = 0;
+            while (feedbackQueue.length && guard++ < 100) {
+                const it = feedbackQueue.shift();
+                try { it.send(function () {}); } catch (_) {}
+            }
+            return;
+        }
+        feedbackDraining = true;
+        const chain = queueFeedbackSlot((release) => {
+            const item = feedbackQueue.shift();
+            if (!item) { release(true); return; }
+            try { console.log('[Feedback] seq=' + (item.seq || '?') + ' sending, remaining=' + feedbackQueue.length); } catch (_) {}
+            const countdown = item.isAttachment
+                ? (2 + Math.floor(Math.random() * 3))
+                : (3 + Math.floor(Math.random() * 5));
+            let fired = false;
+            const fire = () => {
+                if (fired) return;
+                fired = true;
+                try { pendingTimers.delete(item.cardId); } catch (_) {}
+                try { if (item.controller) item.controller.hidePacing(); } catch (_) {}
+                waitForGenerationEnd(() => {
+                    try { item.send(release); } catch (_) { release(true); }
+                });
+            };
+            try { if (item.controller) item.controller.showPacing(countdown, fire); } catch (_) {}
+            try { pendingTimers.set(item.cardId, setTimeout(fire, countdown * 1000)); } catch (_) { fire(); }
+        });
+        const next = () => { feedbackDraining = false; drainFeedbackQueue(); };
+        try { chain.then(next, next); } catch (_) { next(); }
+    }
+    // The site swaps the send control for a "stop generating" control while the
+    // model is still answering. Injecting then either swallows the click (text
+    // stays in the box and the next feedback overwrites it) or clicks stop and
+    // truncates the reply. Bounded wait: a wrong guess costs 15s, never a stall.
+    function isGenerating() {
+        try {
+            const b = findSendButton();
+            if (b) {
+                const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')).toLowerCase();
+                if (/stop|abort|cancel|停止|中断|取消/.test(label)) return true;
+            }
+            if (document.querySelector('.ds-markdown-cursor, [class*="streaming"], [class*="generating"]')) return true;
+        } catch (_) {}
+        return false;
+    }
+    function waitForGenerationEnd(done, maxMs = 15000) {
+        const t0 = Date.now();
+        const tick = () => {
+            let gen = false;
+            try { gen = isGenerating(); } catch (_) {}
+            if (!gen || Date.now() - t0 > maxMs) { done(); return; }
+            try { updateHUD('模型生成中，等它说完再送结果…', '#2563eb'); } catch (_) {}
+            setTimeout(tick, 500);
+        };
+        tick();
+    }
+    // A swallowed send leaves our text sitting in the composer. Injecting the next
+    // feedback on top would overwrite it (silent loss), so flush first, bounded.
+    function composerHoldsOurText() {
+        try {
+            const ta = findInputTextarea();
+            let v = '';
+            if (ta) v = (ta.value !== undefined ? ta.value : ta.innerText) || '';
+            return !!(v && v.indexOf('[Tool Call') === 0);
+        } catch (_) { return false; }
+    }
+    function waitForComposerClear(done, maxMs = 8000) {
+        const t0 = Date.now();
+        const tick = () => {
+            if (!composerHoldsOurText()) { done(true); return; }
+            try { const b = findSendButton(); if (b && !isControlDisabled(b)) triggerSend(); } catch (_) {}
+            if (Date.now() - t0 > maxMs) { done(false); return; }
+            setTimeout(tick, 500);
+        };
+        tick();
+    }
     // Timestamp (ms) of the last successful injectFileToChat, for upload correlation.
     let __attachInjectedAt = 0;
     let cardControllers = {};
     let blockWatchMap = new Map();
-    let pendingFeedbackTimer = null;
+    // ---- Feedback delivery queue: ordering guarantee ----
+    // A result must reach the planner in the order its command was dispatched.
+    // The old path let a random 3-7s countdown decide who entered the send slot
+    // first, so two results completing close together could arrive swapped.
+    // Now the item is enqueued by dispatch seq on arrival, dequeued in seq order,
+    // and the human-like pause is rolled AFTER dequeue.
+    const feedbackQueue = [];
+    const pendingTimers = new Map();   // cardId -> its own countdown timer
+    let feedbackDraining = false;
+    let feedbackDryRun = false;        // test mode: no pacing gate, nothing injected
 
     // ---- Execution ledger: kills stale-block re-execution ----
     // "Already executed" used to be keyed on DOM node identity only (WeakSet).
@@ -189,12 +296,18 @@
     const LEDGER_MAX = 300;
     const execLedger = loadExecLedger();
     const bootAt = Date.now();
-    // Every page load starts with a short register-only window: whatever is
-    // already on screen is history, not a fresh call. This alone stops the
-    // "reload re-runs the last historical code block" bug. A block emitted just
-    // before a reload and never executed falls in this window and is dropped --
-    // loud (HUD) and recoverable by asking the planner to re-issue it.
-    const baselineUntil = bootAt + 3000;
+    // Baseline = register-only mode. A fixed time window is NOT enough: chat.deepseek.com
+    // paints the message list 20s+ after the navigation finishes, so a historical block
+    // that first appears at t=20s looked like a fresh call and got executed -- which is
+    // exactly how a historical write_file block fired 24s after launch and wrote UI text
+    // into the project. Baseline therefore ends only once the message list has been
+    // DOM-stable for a while (see settleTick).
+    let baselineDone = false;
+    let baselineBlocks = 0;
+    let settleCount = -1;
+    let settleChangedAt = bootAt;
+    let settleStable = 0;
+    let settleAnchor = null;   // newest code block on screen when the list settled
     function loadExecLedger() {
         try {
             const raw = sessionStorage.getItem(LEDGER_KEY);
@@ -218,6 +331,31 @@
     // scroll-back lazy-load, or a reload of the very same call. Resets on every
     // page load (fresh JS context), where the ledger takes over instead.
     let lastAckedContainer = null;
+    // End the register-only baseline once the conversation list stops growing.
+    // Everything on screen at that moment is history; settleAnchor becomes the
+    // position marker so only blocks that appear AFTER it can ever execute.
+    function countMessageContainers() {
+        try {
+            return document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id]').length;
+        } catch (_) { return 0; }
+    }
+    function settleTick() {
+        if (baselineDone) return;
+        try {
+            const n = countMessageContainers();
+            const now = Date.now();
+            if (n !== settleCount) { settleCount = n; settleChangedAt = now; settleStable = 0; }
+            else { settleStable++; }
+            const elapsed = now - bootAt;
+            const stableFor = now - settleChangedAt;
+            if ((settleStable >= 4 && stableFor >= 2500 && elapsed >= 8000) || elapsed > 60000) {
+                baselineDone = true;
+                lastAckedContainer = settleAnchor;
+                updateHUD(`启动基线结束：已登记 ${baselineBlocks} 个历史代码块（不执行）`, '#0ea5e9');
+                try { console.log(`[Agent Bridge] baseline ended after ${elapsed}ms: ${baselineBlocks} historical blocks registered, anchor=${settleAnchor ? 'set' : 'none'}`); } catch (_) {}
+            }
+        } catch (_) {}
+    }
     function isAfterLastAcked(node) {
         try {
             if (!lastAckedContainer || !node) return false;
@@ -588,16 +726,42 @@
         let content = lines.join('\n');
         // Clean single leading newline if created by splicing first line
         content = content.replace(/^\r?\n/, '');
-        // Last resort: body pick came back empty (header node matched, or the
-        // block was mid-re-render). Use the block's own text so the write is not
-        // silently turned into a 0-char write. Callers still refuse empty bodies.
+        // Last resort: the body pick came back empty (the banner node matched, or the
+        // block was mid-re-render). Dumping the block's raw text here is what wrote
+        // "write_file:pathCopyDownload" into the project as file content -- the banner
+        // plus the Copy/Download buttons, glued together with no newlines. So sanitize
+        // it, and if nothing legitimate survives, return empty and let the caller
+        // refuse the write. A missed write is recoverable; a corrupted file is not.
         if (!content.trim()) {
             try {
-                const alt = (blockNode.innerText || blockNode.textContent || '').replace(/^\r?\n/, '');
+                const alt = sanitizeFallbackText(blockNode.innerText || blockNode.textContent || '',
+                    fileInfo && fileInfo.path);
                 if (alt.trim()) content = alt;
             } catch (_) {}
         }
         return content;
+    }
+
+    // Strip banner / fence-info / UI-button text out of a raw block dump. Only a
+    // LEADING path echo is removed, so legitimate content that merely mentions the
+    // path survives untouched.
+    function sanitizeFallbackText(raw, path) {
+        const uiOnly = /^(?:copy|download|复制|下载)+$/i;
+        const keep = [];
+        for (const rawLine of String(raw || '').split(/\r?\n/)) {
+            let t = rawLine.trim();
+            if (!t) continue;
+            if (keep.length === 0) {
+                let s = t.replace(/^(?:write_file|write-file|file)\s*:\s*/i, '');
+                if (path && s.indexOf(path) === 0) s = s.slice(path.length);
+                s = s.replace(/(?:copy|download|复制|下载)+$/i, '').trim();
+                if (!s) continue;
+                t = s;
+            }
+            if (uiOnly.test(t)) continue;
+            keep.push(t);
+        }
+        return keep.join('\n');
     }
 
     // 2. Render Tool Call Card UI (Clean Terminal output inside DeepSeek's side)
@@ -794,6 +958,8 @@
     function scanAndProcessToolCalls() {
         if (isExecutingNow) return;
 
+        settleTick();
+
         const blocks = document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block');
         const now = Date.now();
 
@@ -823,6 +989,12 @@
         } catch (_) {}
 
         for (let el of blocks) {
+            // One dispatch at a time. Without this, the extra blocks in a multi-block
+            // message were rendered, marked processed and never executed: commands
+            // 2..N of that message vanished silently, which looks exactly like
+            // "my results don't match my commands". Breaking here leaves them
+            // unprocessed, so the next scan pass runs them in DOM order.
+            if (isExecutingNow) break;
             if (processedBlocks.has(el)) continue;
 
             const parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el;
@@ -895,9 +1067,13 @@
                 blockWatchMap.delete(parent);
                 continue;
             }
-            // Fresh page load: everything already on screen is history.
-            if (Date.now() < baselineUntil) {
+            // Register-only baseline: everything on screen while the list is still
+            // painting is history. It is recorded in the ledger and anchored, so it
+            // can never execute -- not now, not after a re-render, not after a reload.
+            if (!baselineDone) {
                 ledgerAdd(fp);
+                settleAnchor = parent;
+                baselineBlocks++;
                 processedBlocks.add(el); processedBlocks.add(parent);
                 blockWatchMap.delete(parent);
                 continue;
@@ -1402,6 +1578,37 @@
                     disabled: isControlDisabled(b),
                     rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]
                 };
+            },
+            // Ordering self-test. Feeds the REAL feedback queue with a deliberately
+            // shuffled arrival order and reports what the real drainer would deliver.
+            // Dry run: pacing gate bypassed, nothing injected into the composer.
+            testFeedbackOrder: function(seqs) {
+                const arrived = (seqs && seqs.length) ? seqs.slice() : [3, 1, 5, 2, 4];
+                const drained = [];
+                const savedDry = feedbackDryRun;
+                const savedQueue = feedbackQueue.splice(0, feedbackQueue.length);
+                feedbackDryRun = true;
+                try {
+                    for (const s of arrived) {
+                        // Real entry point: same push + order + (deferred) drain as production.
+                        enqueueFeedback({
+                            seq: s, cardId: 'test-' + s, isAttachment: false, controller: null,
+                            send: function (release) { drained.push(s); release(true); }
+                        });
+                    }
+                    drainFeedbackQueue();
+                } catch (e) {
+                    return { error: String((e && e.message) || e) };
+                } finally {
+                    feedbackDryRun = savedDry;
+                    feedbackQueue.length = 0;
+                    for (const it of savedQueue) feedbackQueue.push(it);
+                }
+                const expected = arrived.slice().sort((a, b) => a - b);
+                return { arrived: arrived, drained: drained, expected: expected, ok: JSON.stringify(drained) === JSON.stringify(expected) };
+            },
+            feedbackQueueState: function() {
+                return { pending: feedbackQueue.map(i => i.seq), draining: feedbackDraining, timers: Array.from(pendingTimers.keys()) };
             }
         },
         insertText: function(text) {
@@ -1566,24 +1773,37 @@ ${output}
 \`\`\`
 (注：附件未能挂载显示，已转纯文本反馈，请继续。若需继续执行请输出 \`\`\`local_cmd 代码块，若完成请直接解答。)`;
 
-            // Human-like pre-send pause, re-rolled every round (the pacing
-            // bar already displays the value, so the UI stays truthful).
-            let countdown = (isAttachment && fileObj)
-                ? (2 + Math.floor(Math.random() * 3))
-                : (3 + Math.floor(Math.random() * 5));
-            if (controller) {
-                controller.showPacing(countdown, () => {
-                    if (pendingFeedbackTimer) clearTimeout(pendingFeedbackTimer);
-                    sendFeedbackNow();
-                });
-            }
-
-            function sendFeedbackNow() {
-                if (controller) controller.hidePacing();
-                // Serialize on the send slot: fill+click only after the previous
-                // send's completion request has left (or fallback timeout).
-                queueFeedbackSlot((release) => {
+            // Ordered delivery. This item enters the queue the moment the result
+            // arrives (arrival order == dispatch order, the host serializes
+            // execution), and the human-like pause is rolled after dequeue inside
+            // drainFeedbackQueue -- so a random countdown can no longer invert the
+            // order two results reach the planner in.
+            const seqNo = (controller && controller.seq) || 0;
+            const delivery = {
+                seq: seqNo,
+                cardId: controller ? controller.cardId : '',
+                isAttachment: !!(isAttachment && fileObj),
+                controller: controller,
+                retried: false,
+                send: function (release) {
                     try { lastFeedbackForRetry = { text: feedback, at: Date.now(), tag: seqTag }; backoffRetried = false; } catch (_) {}
+                    if (controller) controller.hidePacing();
+
+                    // A failed send is re-queued once (it keeps the lowest seq, so it
+                    // goes first) instead of being dropped when the next feedback
+                    // overwrites the composer.
+                    const finish = (ok) => {
+                        if (!ok && !delivery.retried) {
+                            delivery.retried = true;
+                            try { updateHUD('回执未发出，已重新排队（不会覆盖输入框）', '#f59e0b'); } catch (_) {}
+                            try { console.log('[Feedback] seq=' + seqNo + ' not acked -> requeued'); } catch (_) {}
+                            feedbackQueue.unshift(delivery);
+                            release(true);
+                            return;
+                        }
+                        release(!!ok);
+                    };
+
                     const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
                     updateHUD(hudMsg, "#2563eb");
 
@@ -1594,7 +1814,7 @@ ${output}
                             if (rushed) {
                                 injectPrompt(fallbackFeedback(), true);
                                 verifySentOrRetry((ok) => {
-                                    release(!!ok);
+                                    finish(ok);
                                     burstCollapse();
                                     setTimeout(() => {
                                         updateHUD("Tool Call 引擎就绪", "#10b981");
@@ -1620,7 +1840,7 @@ ${output}
                                     try { clearInterval(clickIv); } catch (_) {}
                                     triggerSend();
                                     verifySentOrRetry((ok2) => {
-                                        release(!!ok2);
+                                        finish(ok2);
                                         burstCollapse();
                                         setTimeout(() => {
                                             updateHUD("Tool Call 引擎就绪", "#10b981");
@@ -1630,23 +1850,26 @@ ${output}
                                 }
                             }, 100);
                         });
-                    } else {
+                        return;
+                    }
+
+                    // Plain path: never inject on top of an unsent earlier feedback.
+                    waitForComposerClear(() => {
                         injectPrompt(feedback, true);
                         burstCollapse();
-                        // Slot covers injectPrompt's internal 500ms delayed click;
+                        // Slot covers injectPrompt's internal delayed click;
                         // verify the send actually left instead of assuming.
                         setTimeout(() => {
-                            verifySentOrRetry((ok) => { release(!!ok); });
+                            verifySentOrRetry((ok) => { finish(ok); });
                         }, 700);
                         setTimeout(() => {
                             updateHUD("Tool Call 引擎就绪", "#10b981");
                             collapseToolFeedbackBubbles();
                         }, 1500);
-                    }
-                });
-            }
-
-            pendingFeedbackTimer = setTimeout(sendFeedbackNow, (countdown * 1000));
+                    });
+                }
+            };
+            enqueueFeedback(delivery);
         }
     };
     hideGlobal('__agentBridge');
@@ -1805,11 +2028,16 @@ ${output}
     function findSendButton() {
         const isVisible = el => { const r = el.getBoundingClientRect(); return r.width > 4 && r.height > 4; };
         const clickable = [...document.querySelectorAll('button, [role="button"]')].filter(isVisible);
+        // During generation the send control is swapped for a "stop generating"
+        // control that shares the primary+circle styling. Clicking that would
+        // truncate the model's reply, so exclude it explicitly.
+        const labelOf = el => (((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || ''))).toLowerCase();
+        const isStopControl = el => /stop|abort|cancel|停止|中断|取消/.test(labelOf(el));
 
         // 1. Explicit accessible name -- cheapest when the locale/version provides one.
         let btn = clickable.find(b => {
-            const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')).toLowerCase();
-            return label.includes('send') || label.includes('发送');
+            const label = labelOf(b);
+            return (label.includes('send') || label.includes('发送')) && !isStopControl(b);
         });
         if (btn) return btn;
 
@@ -1820,7 +2048,8 @@ ${output}
         btn = clickable.find(b =>
             b.classList.contains('ds-button--primary') &&
             b.classList.contains('ds-button--circle') &&
-            !isControlDisabled(b));
+            !isControlDisabled(b) &&
+            !isStopControl(b));
         if (btn) return btn;
 
         // 3. Geometric fallback: rightmost visible clickable element on the composer row.
