@@ -528,10 +528,11 @@ namespace DeepSeek
                 {
                     string path = root.TryGetProperty("path", out var p) ? p.GetString() ?? "" : "";
                     string content = root.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
+                    int sentLen = root.TryGetProperty("contentLen", out var cl) && cl.ValueKind == JsonValueKind.Number && cl.TryGetInt32(out int clv) ? clv : -1;
                     string id = root.TryGetProperty("id", out var idProp) ? idProp.GetString() ?? "" : "";
                     if (!string.IsNullOrEmpty(path) && !string.IsNullOrEmpty(id))
                     {
-                        _ = HandleFileWriteAsync(id, path, content);
+                        _ = HandleFileWriteAsync(id, path, content, sentLen);
                     }
                 }
                 else if (action == "paths_dropped")
@@ -582,8 +583,12 @@ namespace DeepSeek
             }
         }
 
-        private async Task HandleFileWriteAsync(string id, string path, string content)
+        private async Task HandleFileWriteAsync(string id, string path, string content, int sentLen = -1)
         {
+            // Sent-vs-received length. This settles, in one log line, whether a
+            // 0-char write was produced in the page (JS sent 0) or lost inside the
+            // bridge (JS sent N, host got 0). Before this, both looked identical.
+            App.Log($"[write_file] <- {path} (JS sent {sentLen} chars, host received {content?.Length ?? 0})");
             // Single feedback channel: write results now go through the same path as
             // local_cmd results. They used to be injected straight into the composer
             // while local_cmd results could go out-of-band, which put one conversation
@@ -592,6 +597,17 @@ namespace DeepSeek
             async Task RejectWriteAsync(string reason)
             {
                 await FeedResultBackAsync(id, 1, reason, cmdEcho: cmdEcho);
+            }
+
+            // Content lost inside the bridge: JS sent a real body, host got nothing.
+            // Distinct from an empty extraction in the page, which the scanner now
+            // refuses to dispatch at all.
+            if (sentLen > 0 && (content?.Length ?? 0) == 0)
+            {
+                App.Log($"[write_file] 传输层丢内容: {path} (sent {sentLen}, received 0)");
+                await RejectWriteAsync($"[写入中断] 内容在浏览器→宿主通道丢失（JS 发出 {sentLen} 字符，宿主收到 0），与你的内容无关。"
+                    + "请原样重发一次 ```write_file:{path} 代码块；若连续两次丢失，改用 local_cmd 写入。");
+                return;
             }
 
             // Depth defense: reject UI-residue paths and suspicious near-empty writes.

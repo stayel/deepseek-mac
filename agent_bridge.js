@@ -1053,6 +1053,7 @@
             action: "write_file",
             path: path,
             content: content,
+            contentLen: content.length,
             id: controller.cardId
         });
     }
