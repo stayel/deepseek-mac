@@ -64,6 +64,7 @@
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 且只用相对路径（禁绝对路径，含空格路径会解析失败）；必须用绝对路径时改走 local_cmd 用 PowerShell 创建；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。
+【配对自检】：每条工具结果都带 #序号 与 CMD/PATH 回显。若回来的结果与你的命令不符（序号跳号、CMD 对不上、内容像是更早一次的输出），直接说明"这与我的命令不符"并要求重跑，不要顺着这个结果往下推断。
 【搜索纪律】：禁裸扫全盘——用户目录根/盘符根/注册表递归必须带 -Depth（≤3），先 Desktop/Documents/Projects，禁 AppData；护栏会直接打回无 -Depth 的裸扫；确需全量加注释 #scan-ok。
 请确认收到，并等待用户指令。`;
 
@@ -175,6 +176,75 @@
     let cardControllers = {};
     let blockWatchMap = new Map();
     let pendingFeedbackTimer = null;
+
+    // ---- Execution ledger: kills stale-block re-execution ----
+    // "Already executed" used to be keyed on DOM node identity only (WeakSet).
+    // React re-mounts and page reloads hand us *fresh* nodes for *old* messages,
+    // so the last historical code block got re-executed and its output was fed
+    // back as the answer to whatever the planner had just asked for -- the
+    // "results don't match my command" symptom. The ledger is content-addressed
+    // and survives reloads (sessionStorage = one browsing session, exactly the
+    // scope we want: a reload keeps it, a fresh app start re-baselines).
+    const LEDGER_KEY = 'ds_agent_seen_v1';
+    const LEDGER_MAX = 300;
+    const execLedger = loadExecLedger();
+    const bootAt = Date.now();
+    // Every page load starts with a short register-only window: whatever is
+    // already on screen is history, not a fresh call. This alone stops the
+    // "reload re-runs the last historical code block" bug. A block emitted just
+    // before a reload and never executed falls in this window and is dropped --
+    // loud (HUD) and recoverable by asking the planner to re-issue it.
+    const baselineUntil = bootAt + 3000;
+    function loadExecLedger() {
+        try {
+            const raw = sessionStorage.getItem(LEDGER_KEY);
+            if (!raw) return new Set();
+            const arr = JSON.parse(raw);
+            return Array.isArray(arr) ? new Set(arr.filter(x => typeof x === 'string')) : new Set();
+        } catch (_) { return new Set(); }
+    }
+    function ledgerHas(fp) { return execLedger.has(fp); }
+    function ledgerAdd(fp) {
+        try {
+            execLedger.add(fp);
+            const arr = Array.from(execLedger);
+            if (arr.length > LEDGER_MAX) arr.splice(0, arr.length - LEDGER_MAX);
+            sessionStorage.setItem(LEDGER_KEY, JSON.stringify(arr));
+        } catch (_) {}
+    }
+    // Last block we actually dispatched. Already-executed content only counts as a
+    // NEW call when it appears strictly after this node in document order -- that
+    // is how a deliberate re-issue is told apart from a re-rendered copy, a
+    // scroll-back lazy-load, or a reload of the very same call. Resets on every
+    // page load (fresh JS context), where the ledger takes over instead.
+    let lastAckedContainer = null;
+    function isAfterLastAcked(node) {
+        try {
+            if (!lastAckedContainer || !node) return false;
+            if (lastAckedContainer === node) return false;
+            if (!lastAckedContainer.isConnected) return false;
+            // 4 === Node.DOCUMENT_POSITION_FOLLOWING
+            return (lastAckedContainer.compareDocumentPosition(node) & 4) !== 0;
+        } catch (_) { return false; }
+    }
+    // FNV-1a + length: cheap, synchronous, no crypto dependency.
+    function fpHash(str) {
+        let h = 0x811c9dc5;
+        for (let i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h = (h * 0x01000193) >>> 0;
+        }
+        return h.toString(16).padStart(8, '0');
+    }
+    function blockFingerprint(kind, target, body) {
+        const s = String(body || '');
+        return kind + ':' + fpHash(kind + '\u0000' + String(target || '') + '\u0000' + s) + ':' + s.length;
+    }
+    // Monotonic per-dispatch id: stamped on the card AND echoed in the feedback,
+    // so any result can be traced back to the command that produced it.
+    let dispatchSeq = 0;
+    let inflight = null;   // { id, seq, kind, target, cmdHead, startedAt }
+
     // Direct-loop virtual queue: replies arriving out-of-band are scanned here
     // and dispatched one at a time (the page stays a passive viewport).
     let virtualQueue = [];
@@ -328,8 +398,35 @@
             .replace(/'/g, "&#039;");
     }
 
+    // The code BODY must never be confused with the fence's language label.
+    // The old selector `.md-code-block-content code, pre code, code` returned the
+    // FIRST <code> in the block, which can be the header/infostring node -> empty
+    // body -> the host answered "[拒绝写入] 内容过短(0 字符)" for a 2000+ char write.
+    // Pick the longest candidate instead: a body is always longer than a label.
+    function pickCodeBody(blockNode) {
+        if (!blockNode) return null;
+        const isHeaderish = (el) => {
+            try {
+                return !!(el.closest && el.closest('[class*="banner"], [class*="infostring"], [class*="header"], [class*="lang"], [class*="copy"], [class*="toolbar"]'));
+            } catch (_) { return false; }
+        };
+        const candidates = [];
+        const push = (el) => { if (el && !isHeaderish(el)) candidates.push(el); };
+        try { push(blockNode.querySelector('.md-code-block-content code')); } catch (_) {}
+        try { push(blockNode.querySelector('.md-code-block-content')); } catch (_) {}
+        try { blockNode.querySelectorAll('pre code').forEach(push); } catch (_) {}
+        try { blockNode.querySelectorAll('code').forEach(push); } catch (_) {}
+        try { blockNode.querySelectorAll('pre').forEach(push); } catch (_) {}
+        let best = null, bestLen = -1;
+        for (const el of candidates) {
+            const t = el.innerText || el.textContent || '';
+            if (t.length > bestLen) { best = el; bestLen = t.length; }
+        }
+        return best;
+    }
+
     function extractPureCommand(blockNode) {
-        let codeEl = blockNode.querySelector('.md-code-block-content code, pre code, code');
+        let codeEl = pickCodeBody(blockNode);
         let rawText = codeEl ? (codeEl.innerText || codeEl.textContent) : (blockNode.innerText || blockNode.textContent);
 
         const lines = (rawText || '').split(/\r?\n/).filter(line => {
@@ -374,7 +471,7 @@
     function detectFileWriteBlock(blockNode) {
         if (!blockNode) return null;
 
-        const codeEl = blockNode.querySelector('.md-code-block-content code, pre code, code');
+        const codeEl = pickCodeBody(blockNode);
         const fullText = (blockNode.innerText || blockNode.textContent || '').trim();
         const banner = blockNode.querySelector('[class*="banner"], [class*="infostring"], [class*="header"], [class*="lang"]');
         const bannerText = (banner ? (banner.innerText || banner.textContent || '') : '').trim();
@@ -462,7 +559,7 @@
     }
 
     function extractFileContent(blockNode, fileInfo) {
-        let codeEl = blockNode.querySelector('.md-code-block-content code, pre code, code');
+        let codeEl = pickCodeBody(blockNode);
         let rawText = codeEl ? (codeEl.innerText || codeEl.textContent) : (blockNode.innerText || blockNode.textContent);
         let lines = (rawText || '').split(/\r?\n/);
 
@@ -491,6 +588,15 @@
         let content = lines.join('\n');
         // Clean single leading newline if created by splicing first line
         content = content.replace(/^\r?\n/, '');
+        // Last resort: body pick came back empty (header node matched, or the
+        // block was mid-re-render). Use the block's own text so the write is not
+        // silently turned into a 0-char write. Callers still refuse empty bodies.
+        if (!content.trim()) {
+            try {
+                const alt = (blockNode.innerText || blockNode.textContent || '').replace(/^\r?\n/, '');
+                if (alt.trim()) content = alt;
+            } catch (_) {}
+        }
         return content;
     }
 
@@ -545,7 +651,7 @@
             <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: ${headerGradient}; border-bottom: 1px solid ${headerBorder};">
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <span style="font-size: 16px;">${icon}</span>
-                    <span style="font-weight: 700; font-size: 12px; color: ${headerTitleColor}; letter-spacing: 0.3px;">${headerTitle}</span>
+                    <span id="${cardId}-title" style="font-weight: 700; font-size: 12px; color: ${headerTitleColor}; letter-spacing: 0.3px;">${headerTitle}</span>
                     <span style="background: ${tagBg}; color: #ffffff; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 5px; font-family: ui-monospace, monospace;">${tagLabel}</span>
                 </div>
                 <div style="display: flex; align-items: center; gap: 10px;">
@@ -579,6 +685,16 @@
             type,
             isFile,
             meta,
+            seq: 0,
+            target: '',
+            cmdHead: '',
+            // Stamp the dispatch sequence onto the card so the number the planner
+            // quotes in its feedback matches a card the operator can point at.
+            setSeq: (seq) => {
+                controller.seq = seq;
+                const t = document.getElementById(`${cardId}-title`);
+                if (t) t.textContent = headerTitle + ' #' + seq;
+            },
             setStatus: (msg, color, isSpinning) => {
                 const st = document.getElementById(`${cardId}-status`);
                 if (st) {
@@ -753,6 +869,40 @@
                 trackKey = cleanCmd;
             }
 
+            const fp = isFileWrite
+                ? blockFingerprint('w', fileInfo.path, fileContent)
+                : blockFingerprint('c', '', cleanCmd);
+
+            // Never hand an empty write to the host. The old code dispatched it and
+            // the host answered "[拒绝写入] 内容过短(0 字符)" for a 2000+ char write.
+            // An empty body means we grabbed the fence label instead of the body, or
+            // the block is mid-re-render -- skip now, a later pass picks it up.
+            if (isFileWrite && !fileContent.trim()) {
+                try { console.warn('[Agent Bridge] Empty write body ignored: ' + fileInfo.path); } catch (_) {}
+                processedBlocks.add(el); processedBlocks.add(parent);
+                blockWatchMap.delete(parent);
+                updateHUD('捕获到空内容写入，已拒绝下发：' + fileInfo.path, '#f59e0b');
+                continue;
+            }
+
+            // Already-executed content is only re-run when it appears in a message
+            // strictly AFTER the last one we dispatched (a deliberate re-issue).
+            // A re-render, a scroll-back lazy-load, or a reload of the same call is
+            // suppressed -- those were being re-executed and their output fed back
+            // as the answer to a newer question.
+            if (ledgerHas(fp) && !isAfterLastAcked(parent)) {
+                processedBlocks.add(el); processedBlocks.add(parent);
+                blockWatchMap.delete(parent);
+                continue;
+            }
+            // Fresh page load: everything already on screen is history.
+            if (Date.now() < baselineUntil) {
+                ledgerAdd(fp);
+                processedBlocks.add(el); processedBlocks.add(parent);
+                blockWatchMap.delete(parent);
+                continue;
+            }
+
             // Debounce
             let tracker = blockWatchMap.get(parent);
             if (!tracker) {
@@ -776,6 +926,10 @@
                 continue;
             }
 
+            // Register BEFORE dispatch: a reload in the middle of the run must not
+            // replay this call when the page comes back.
+            ledgerAdd(fp);
+            lastAckedContainer = parent;
             processedBlocks.add(el);
             processedBlocks.add(parent);
             blockWatchMap.delete(parent);
@@ -825,9 +979,22 @@
         }
         lastDispatch = { cmd: normCmd, at: nowMs };
 
+        dispatchSeq++;
+        controller.setSeq(dispatchSeq);
+        controller.cmdHead = normCmd.slice(0, 120);
+        controller.target = '';
+        inflight = {
+            id: controller.cardId,
+            seq: dispatchSeq,
+            kind: 'cmd',
+            target: '',
+            cmdHead: controller.cmdHead,
+            startedAt: nowMs
+        };
+
         isExecutingNow = true;
         controller.hidePacing();
-        controller.setStatus("正在执行本地命令...", "#d97706", true);
+        controller.setStatus(`正在执行本地命令... #${dispatchSeq}`, "#d97706", true);
         controller.setOutput("[本地终端进程已启动，正在执行指令...]");
         // Elapsed ticker so a long silent run doesn't look wedged.
         try {
@@ -861,9 +1028,22 @@
         }
         lastDispatch = { cmd: sig, at: nowMs };
 
+        dispatchSeq++;
+        controller.setSeq(dispatchSeq);
+        controller.target = path;
+        controller.cmdHead = 'write_file ' + path;
+        inflight = {
+            id: controller.cardId,
+            seq: dispatchSeq,
+            kind: 'write_file',
+            target: path,
+            cmdHead: controller.cmdHead,
+            startedAt: nowMs
+        };
+
         isExecutingNow = true;
         controller.hidePacing();
-        controller.setStatus("正在写入本地文件...", "#0d9488", true);
+        controller.setStatus(`正在写入本地文件... #${dispatchSeq}`, "#0d9488", true);
         controller.setOutput(`[正在将文件落盘至本地系统...]\n目标路径: ${path}\n文件大小: ${content.length} 字符`);
         updateHUD("正在写入本地文件...", "#0d9488");
 
@@ -1247,9 +1427,15 @@
             } catch (_) {}
         },
         onDirectSendSuccess: function(cardId) {
-            isExecutingNow = false;
+            const c0 = cardControllers[cardId];
+            if (!c0) {
+                // Ack for a card that no longer exists (page reloaded mid-run).
+                try { console.error('[Agent Bridge] Orphan direct-send ack ignored: ' + cardId); } catch (_) {}
+                return;
+            }
+            if (!inflight || inflight.id === cardId) { inflight = null; isExecutingNow = false; }
             try {
-                const c = cardControllers[cardId];
+                const c = c0;
                 if (c) {
                     if (c._tickIv) { clearInterval(c._tickIv); c._tickIv = null; }
                     c.setStatus('⚡ 结果已后台直达 DeepSeek 模型', '#10b981', false);
@@ -1281,12 +1467,24 @@
             } catch (e) { console.error('[Agent Bridge] onDirectReply error:', e); }
         },
         onCommandResult: function(data) {
-            isExecutingNow = false;
             const cardId = data.id;
+            const controller0 = cardControllers[cardId];
+            // Orphan result: the card it belonged to no longer exists (the page was
+            // reloaded mid-run, or the UI was torn down). Feeding it back would hand
+            // the planner an un-attributed answer to a question it did not ask --
+            // exactly the "old output attached to my new command" report. Drop it
+            // loudly instead of guessing which request it belonged to.
+            if (!controller0) {
+                try { console.error('[Agent Bridge] Orphan tool result dropped (no card for id=' + cardId + ')'); } catch (_) {}
+                try { diagAttach({ phase: 'orphan-result', id: String(cardId || '') }); } catch (_) {}
+                updateHUD('已丢弃一条无主结果（页面刷新导致），请让 DeepSeek 手动继续', '#ef4444');
+                return;
+            }
+            // Only the dispatch that is actually in flight may release the loop.
+            if (!inflight || inflight.id === cardId) { inflight = null; isExecutingNow = false; }
             const exitCode = data.exitCode;
             try {
-                const _c = cardControllers[cardId];
-                if (_c && _c._tickIv) { clearInterval(_c._tickIv); _c._tickIv = null; }
+                if (controller0._tickIv) { clearInterval(controller0._tickIv); controller0._tickIv = null; }
             } catch (_) {}
             try { pumpVirtual(); } catch (_) {}
             const output = data.output || "(执行完毕，无输出)";
@@ -1308,7 +1506,7 @@
                 }
             }
 
-            const controller = cardControllers[cardId];
+            const controller = controller0;
             const isSuccess = (exitCode === 0);
             const isFile = controller && (controller.isFile || controller.type === 'write_file');
 
@@ -1327,21 +1525,29 @@
                 }
             }
 
+            // Attribution: every result carries the sequence number of the dispatch
+            // that produced it plus an echo of the command/path. Without this the
+            // planner literally cannot tell which command an output belongs to, so a
+            // mismatch was indistinguishable from a correct answer.
+            const seqTag = '#' + (controller.seq || '?');
             let feedback = "";
             if (isFile) {
-                feedback = `[Tool Call: 本地文件直接写入结果 (Exit: ${exitCode})]:
+                const chars = (controller.meta && typeof controller.meta.content === 'string') ? controller.meta.content.length : '?';
+                feedback = `[Tool Call Result ${seqTag} write_file (Exit: ${exitCode})]:
+PATH: ${controller.target || '?'} | CHARS: ${chars}
 ${output}
 
 请根据写入结果继续。若写完需运行测试，请输出 \`\`\`local_cmd 代码块；若还需写入其他文件请输出 \`\`\`write_file 代码块；若全部完成请给出最终解答。`;
             } else if (isAttachment && fileObj) {
                 const isImg = (data.mimeType || "").startsWith("image/");
                 const desc = data.prompt || (isImg ? "屏幕截图已捕获，请查看附件图片进行分析与判断。" : "相关数据已作为附件挂载至输入框。");
-                feedback = `[Tool Call 附件就绪]: ${desc}
+                feedback = `[Tool Call Result ${seqTag} attachment (Exit: ${exitCode})]: ${desc}
 （附件: ${data.filename}，大小: ${Math.round(fileObj.size / 1024)} KB）
 
 请阅读并分析上述附件内容，继续进行下一步判断或直接给出回答。`;
             } else {
-                feedback = `[Tool Call Result (Exit: ${exitCode})]:
+                feedback = `[Tool Call Result ${seqTag} (Exit: ${exitCode})]:
+CMD: ${controller.cmdHead || '(未记录)'}
 \`\`\`
 ${output}
 \`\`\`
@@ -1352,7 +1558,8 @@ ${output}
             }
 
             // Text-only fallback used when the attachment never materialized.
-            const fallbackFeedback = () => `[Tool Call Result (Exit: ${exitCode})]:
+            const fallbackFeedback = () => `[Tool Call Result ${seqTag} (Exit: ${exitCode})]:
+CMD: ${controller.cmdHead || '(未记录)'}
 \`\`\`
 ${output}
 \`\`\`
@@ -1375,7 +1582,7 @@ ${output}
                 // Serialize on the send slot: fill+click only after the previous
                 // send's completion request has left (or fallback timeout).
                 queueFeedbackSlot((release) => {
-                    try { lastFeedbackForRetry = { text: feedback, at: Date.now() }; backoffRetried = false; } catch (_) {}
+                    try { lastFeedbackForRetry = { text: feedback, at: Date.now(), tag: seqTag }; backoffRetried = false; } catch (_) {}
                     const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
                     updateHUD(hudMsg, "#2563eb");
 
@@ -1496,9 +1703,12 @@ ${output}
             const wInfo = info.match(/^(?:write_file|write-file):\s*(\S+)/i);
             if (wInfo && wInfo[1]) {
                 const p = cleanPathCandidate(wInfo[1]);
-                if (p) {
-                    const key = 'w:' + p;
-                    if (!seen.has(key)) { seen.add(key); out.push({ type: 'write_file', path: p, content: stripVirtualDirective(body) }); }
+                const bodyContent = stripVirtualDirective(body);
+                if (p && bodyContent.trim()) {
+                    const key = 'w:' + p + ':' + bodyContent.length;
+                    if (!seen.has(key)) { seen.add(key); out.push({ type: 'write_file', path: p, content: bodyContent }); }
+                } else if (p) {
+                    try { console.warn('[Agent Bridge] virtual write skipped (empty body): ' + p); } catch (_) {}
                 }
                 continue;
             }
@@ -1523,9 +1733,12 @@ ${output}
             const cm = fl && fl.match(/^(?:#|\/\/|\/\*|--|;|<!--)\s*(?:file|filepath|path):\s*(\S+)/i);
             if (cm && cm[1]) {
                 const p = cleanPathCandidate(cm[1]);
-                if (p) {
-                    const key = 'w:' + p;
-                    if (!seen.has(key)) { seen.add(key); out.push({ type: 'write_file', path: p, content: stripVirtualDirective(body) }); }
+                const bodyContent = stripVirtualDirective(body);
+                if (p && bodyContent.trim()) {
+                    const key = 'w:' + p + ':' + bodyContent.length;
+                    if (!seen.has(key)) { seen.add(key); out.push({ type: 'write_file', path: p, content: bodyContent }); }
+                } else if (p) {
+                    try { console.warn('[Agent Bridge] virtual write skipped (empty body): ' + p); } catch (_) {}
                 }
             }
         }
@@ -1925,6 +2138,17 @@ ${output}
         createFloatingHUD();
         scanAndProcessToolCalls();
         collapseToolFeedbackBubbles();
+        // In-flight watchdog: a result that never comes back must not wedge the
+        // loop forever (the host caps one command at 180s, so 200s is safe).
+        try {
+            if (inflight && Date.now() - inflight.startedAt > 200000) {
+                try { console.error('[Agent Bridge] in-flight watchdog: releasing stuck dispatch ' + inflight.id); } catch (_) {}
+                updateHUD('上一条命令 200 秒无结果，已解除占用', '#ef4444');
+                inflight = null;
+                isExecutingNow = false;
+                pumpVirtual();
+            }
+        } catch (_) {}
     }, 600);
 
     // Rate-limit watcher: the site refuses burst sends ("Messages too frequent")
@@ -1951,6 +2175,22 @@ ${output}
         } catch (_) {}
         return null;
     }
+    // Was this result already delivered? The original click can land while we are
+    // still cooling down from a rate limit, and re-sending the same result as a
+    // second user message makes the planner answer the first copy while the page
+    // shows the second -- one more source of "the reply doesn't match my command".
+    function feedbackAlreadyInChat(tag) {
+        try {
+            if (!document.body || !tag) return false;
+            const nodes = document.querySelectorAll('[class*="chat-item"], [class*="message"]');
+            for (let i = nodes.length - 1, n = 0; i >= 0 && n < 40; i--, n++) {
+                const t = nodes[i].innerText || '';
+                if (t.indexOf(tag) !== -1 && t.indexOf('[Tool Call Result') !== -1) return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
     function enterBackoff(source, detail) {
         try {
             rateLimitBackoffUntil = Date.now() + BACKOFF_MS;
@@ -1984,6 +2224,13 @@ ${output}
                 if (autoExecute && !backoffRetried && lastFeedbackForRetry.text &&
                     Date.now() - lastFeedbackForRetry.at < 10 * 60 * 1000) {
                     backoffRetried = true;
+                    // Never re-send a result that already reached the chat.
+                    if (lastFeedbackForRetry.tag && feedbackAlreadyInChat(lastFeedbackForRetry.tag)) {
+                        try { console.log('[Agent Bridge] rate-limit retry skipped: ' + lastFeedbackForRetry.tag + ' already in chat'); } catch (_) {}
+                        updateHUD('冷却结束：上一条反馈已在聊天中，跳过重发', '#10b981');
+                        lastFeedbackForRetry = { text: '', at: 0, tag: '' };
+                        return;
+                    }
                     updateHUD('冷却结束，稍后重发上一条反馈…', '#2563eb');
                     try { diagAttach({ phase: 'rate-limit-retry' }); } catch (_) {}
                     // Small extra irregular delay so the retry doesn't fire

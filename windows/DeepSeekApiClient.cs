@@ -60,13 +60,26 @@ namespace DeepSeek
 
         public void UpdateSessionState(string? sessionId, int? messageId)
         {
-            if (!string.IsNullOrEmpty(sessionId))
+            if (!string.IsNullOrEmpty(sessionId) && !string.Equals(sessionId, _currentSessionId, StringComparison.Ordinal))
             {
+                // New conversation: never chain the next turn onto the previous
+                // chat's message id.
                 _currentSessionId = sessionId;
+                _lastMessageId = null;
+                App.Log($"[ApiClient] session switched -> {sessionId}, parent id reset");
             }
             if (messageId.HasValue && messageId.Value > 0)
             {
-                _lastMessageId = messageId.Value;
+                // Monotonic guard. Page sniffing reports the PARENT of a request,
+                // which is by definition older than the id we may already have
+                // chained onto from our own out-of-band reply. Letting it regress
+                // threads the next tool result onto an older branch, so the model
+                // answers from a stale context -- the "result doesn't match my
+                // command" symptom.
+                if (!_lastMessageId.HasValue || messageId.Value > _lastMessageId.Value)
+                {
+                    _lastMessageId = messageId.Value;
+                }
             }
         }
 
@@ -236,7 +249,7 @@ namespace DeepSeek
             using var reader = new StreamReader(stream, Encoding.UTF8);
 
             var replySb = new StringBuilder();
-            int? replyMsgId = null;
+            var idPick = new SseIdPick();
             bool shapeLogged = false;
             StreamWriter? tee = null;
             try
@@ -263,7 +276,7 @@ namespace DeepSeek
                     if (string.IsNullOrEmpty(data)) continue;
                     try
                     {
-                        ExtractSsePayload(data, replySb, ref replyMsgId, ref shapeLogged);
+                        ExtractSsePayload(data, replySb, idPick, ref shapeLogged);
                     }
                     catch (Exception ex)
                     {
@@ -274,14 +287,24 @@ namespace DeepSeek
             }
             finally { try { tee?.Dispose(); } catch { } }
 
-            App.Log($"[ApiClient] Direct completion streamed successfully for session {sessionId} (reply {replySb.Length} chars, msgId={replyMsgId?.ToString() ?? "?"})");
-            return new DirectResult { Ok = true, ReplyText = replySb.ToString(), ReplyMessageId = replyMsgId, SessionId = sessionId };
+            App.Log($"[ApiClient] Direct completion streamed successfully for session {sessionId} (reply {replySb.Length} chars, msgId={idPick.Id?.ToString() ?? "?"})");
+            return new DirectResult { Ok = true, ReplyText = replySb.ToString(), ReplyMessageId = idPick.Id, SessionId = sessionId };
         }
 
+        // Candidate id sources, priority order. The old code took the MAX numeric
+        // value found anywhere in the payload, which could latch onto an unrelated
+        // nested id and chain the next turn onto the wrong branch.
         private static readonly string[] SseTextKeys = { "content", "text", "output_text", "response", "answer" };
         private static readonly string[] SseIdKeys = { "message_id", "msg_id", "parent_message_id" };
 
-        private static void ExtractSsePayload(string dataJson, StringBuilder replySb, ref int? replyMsgId, ref bool shapeLogged)
+        private sealed class SseIdPick
+        {
+            public int? Id;
+            public int Depth = int.MaxValue;
+            public int Priority = int.MaxValue;
+        }
+
+        private static void ExtractSsePayload(string dataJson, StringBuilder replySb, SseIdPick pick, ref bool shapeLogged)
         {
             using var d = JsonDocument.Parse(dataJson);
             var r = d.RootElement;
@@ -297,23 +320,30 @@ namespace DeepSeek
                 }
                 catch { }
             }
-            CollectSseNode(r, replySb, ref replyMsgId, 0);
+            CollectSseNode(r, replySb, pick, 0);
         }
 
-        private static void CollectSseNode(JsonElement el, StringBuilder sb, ref int? msgId, int depth)
+        private static void CollectSseNode(JsonElement el, StringBuilder sb, SseIdPick pick, int depth)
         {
             if (depth > 4) return;
             if (el.ValueKind == JsonValueKind.Array)
             {
-                foreach (var item in el.EnumerateArray()) CollectSseNode(item, sb, ref msgId, depth + 1);
+                foreach (var item in el.EnumerateArray()) CollectSseNode(item, sb, pick, depth + 1);
                 return;
             }
             if (el.ValueKind != JsonValueKind.Object) return;
-            foreach (var key in SseIdKeys)
+            // Shallowest, most specific id wins: the assistant message id lives at
+            // (or near) the top level, while parent_message_id is the previous turn.
+            for (int k = 0; k < SseIdKeys.Length; k++)
             {
-                if (el.TryGetProperty(key, out var mv) && mv.ValueKind == JsonValueKind.Number && mv.TryGetInt32(out int iv))
+                if (el.TryGetProperty(SseIdKeys[k], out var mv) && mv.ValueKind == JsonValueKind.Number &&
+                    mv.TryGetInt32(out int iv) && iv > 0)
                 {
-                    if (!msgId.HasValue || iv > msgId.Value) msgId = iv;
+                    bool better = !pick.Id.HasValue
+                        || depth < pick.Depth
+                        || (depth == pick.Depth && k < pick.Priority);
+                    if (better) { pick.Id = iv; pick.Depth = depth; pick.Priority = k; }
+                    break;   // first matching key wins inside one object
                 }
             }
             bool consumedChoices = false;
@@ -350,7 +380,7 @@ namespace DeepSeek
                 }
                 else if (prop.Value.ValueKind == JsonValueKind.Object || prop.Value.ValueKind == JsonValueKind.Array)
                 {
-                    CollectSseNode(prop.Value, sb, ref msgId, depth + 1);
+                    CollectSseNode(prop.Value, sb, pick, depth + 1);
                 }
             }
         }

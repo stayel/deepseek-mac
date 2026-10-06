@@ -10,6 +10,7 @@ obj/
 *.exe
 publish/
 windows/publish/
+windows/publish-next/
 .vs/
 *.user
 *.suo

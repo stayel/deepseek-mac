@@ -584,15 +584,14 @@ namespace DeepSeek
 
         private async Task HandleFileWriteAsync(string id, string path, string content)
         {
+            // Single feedback channel: write results now go through the same path as
+            // local_cmd results. They used to be injected straight into the composer
+            // while local_cmd results could go out-of-band, which put one conversation
+            // on two diverging threads (the planner then answered from a stale one).
+            string cmdEcho = "write_file " + path;
             async Task RejectWriteAsync(string reason)
             {
-                await Dispatcher.InvokeAsync(async () =>
-                {
-                    var payload = new { id = id, exitCode = 1, output = reason };
-                    string json = JsonSerializer.Serialize(payload);
-                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
-                    await webView.CoreWebView2.ExecuteScriptAsync(js);
-                });
+                await FeedResultBackAsync(id, 1, reason, cmdEcho: cmdEcho);
             }
 
             // Depth defense: reject UI-residue paths and suspicious near-empty writes.
@@ -606,7 +605,9 @@ namespace DeepSeek
             if ((content?.Length ?? 0) < 8 && !path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
             {
                 App.Log($"[write_file] 拒绝可疑空写入: {path} (content {content?.Length ?? 0} chars)");
-                await RejectWriteAsync($"[拒绝写入] 内容过短({content?.Length ?? 0} 字符)且目标非 .txt：{path}。若确需写入请改用 local_cmd，或分步确认后重试。");
+                await RejectWriteAsync($"[拒绝写入] 内容过短({content?.Length ?? 0} 字符)且目标非 .txt：{path}。"
+                    + "宿主端代码块正文提取为空（语言标签被当成了正文）或写入内容本身为空。"
+                    + "请重新完整输出一次 ```write_file:" + path + " 代码块（正文至少 8 字符），或改用 local_cmd 写入。");
                 return;
             }
 
@@ -631,33 +632,13 @@ namespace DeepSeek
 
                 await File.WriteAllTextAsync(resolvedPath, content, new UTF8Encoding(false));
 
-                await Dispatcher.InvokeAsync(async () =>
-                {
-                    var payload = new
-                    {
-                        id = id,
-                        exitCode = 0,
-                        output = $"文件已成功直接落盘写入：{resolvedPath}（共 {Encoding.UTF8.GetByteCount(content)} 字节）。"
-                    };
-                    string json = JsonSerializer.Serialize(payload);
-                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
-                    await webView.CoreWebView2.ExecuteScriptAsync(js);
-                });
+                await FeedResultBackAsync(id, 0,
+                    $"文件已成功直接落盘写入：{resolvedPath}（共 {Encoding.UTF8.GetByteCount(content)} 字节）。",
+                    cmdEcho: cmdEcho);
             }
             catch (Exception ex)
             {
-                await Dispatcher.InvokeAsync(async () =>
-                {
-                    var payload = new
-                    {
-                        id = id,
-                        exitCode = 1,
-                        output = $"文件写入失败: {ex.Message} (路径: {path})"
-                    };
-                    string json = JsonSerializer.Serialize(payload);
-                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
-                    await webView.CoreWebView2.ExecuteScriptAsync(js);
-                });
+                await FeedResultBackAsync(id, 1, $"文件写入失败: {ex.Message} (路径: {path})", cmdEcho: cmdEcho);
             }
         }
 
@@ -873,20 +854,7 @@ namespace DeepSeek
             if (disciplineMsg != null)
             {
                 App.Log($"[ScanGuard] rejected: {command.Substring(0, Math.Min(120, command.Length))}");
-                await Dispatcher.InvokeAsync(async () =>
-                {
-                    try
-                    {
-                        var payload = new { id = id, exitCode = 1, output = disciplineMsg };
-                        string jsonString = JsonSerializer.Serialize(payload);
-                        string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({jsonString});";
-                        await webView.CoreWebView2.ExecuteScriptAsync(js);
-                    }
-                    catch (Exception ex)
-                    {
-                        Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
-                    }
-                });
+                await FeedResultBackAsync(id, 1, disciplineMsg, cmdEcho: command);
                 return;
             }
 
@@ -895,20 +863,7 @@ namespace DeepSeek
             if (!gateTaken)
             {
                 string qOut = "【本地执行排队超时（120 秒），上一条命令仍在运行，请稍后重试】";
-                await Dispatcher.InvokeAsync(async () =>
-                {
-                    try
-                    {
-                        var payload = new { id = id, exitCode = 124, output = qOut };
-                        string jsonString = JsonSerializer.Serialize(payload);
-                        string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({jsonString});";
-                        await webView.CoreWebView2.ExecuteScriptAsync(js);
-                    }
-                    catch (Exception ex)
-                    {
-                        Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
-                    }
-                });
+                await FeedResultBackAsync(id, 124, qOut, cmdEcho: command);
                 return;
             }
 
@@ -1084,7 +1039,7 @@ namespace DeepSeek
                         string filename = Path.GetFileName(filePath);
                         string mime = GetMimeType(Path.GetExtension(filePath));
 
-                        await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: mime, base64Data: b64, prompt: prompt);
+                        await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: mime, base64Data: b64, prompt: prompt, cmdEcho: command);
                         return;
                     }
                 }
@@ -1099,7 +1054,7 @@ namespace DeepSeek
                     string filename = Path.GetFileName(tempFile);
                     string prompt = $"终端输出内容较长（共 {output.Length} 字符），已自动打包为附件 {filename} 供你直接阅读分析。";
 
-                    await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: "text/plain", base64Data: b64, prompt: prompt);
+                    await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: "text/plain", base64Data: b64, prompt: prompt, cmdEcho: command);
                     return;
                 }
 
@@ -1121,7 +1076,7 @@ namespace DeepSeek
             }
 
             // Feed result back (direct API send if enabled, otherwise fallback to web input box)
-            await FeedResultBackAsync(id, exitCode, output);
+            await FeedResultBackAsync(id, exitCode, output, cmdEcho: command);
             }
             finally
             {
@@ -1138,13 +1093,14 @@ namespace DeepSeek
             string? filename = null,
             string? mimeType = null,
             string? base64Data = null,
-            string? prompt = null)
+            string? prompt = null,
+            string? cmdEcho = null)
         {
             if (App.DirectSendEnabled)
             {
                 try
                 {
-                    DirectResult? direct = await TryDirectSendAsync(id, exitCode, output, isAttachment, filename, mimeType, base64Data, prompt);
+                    DirectResult? direct = await TryDirectSendAsync(id, exitCode, output, isAttachment, filename, mimeType, base64Data, prompt, cmdEcho);
                     if (direct != null && direct.Ok)
                     {
                         // Chain the next turn on OUR OWN reply id (page sniffing goes stale in direct mode).
@@ -1215,7 +1171,8 @@ namespace DeepSeek
             string? filename,
             string? mimeType,
             string? base64Data,
-            string? prompt)
+            string? prompt,
+            string? cmdEcho = null)
         {
             if (webView?.CoreWebView2 == null) return null;
 
@@ -1257,7 +1214,10 @@ namespace DeepSeek
             }
             else
             {
-                feedbackPrompt = $"[Tool Call Result (Exit: {exitCode})]:\n```\n{output}\n```\n请根据上述终端执行结果继续。若需继续执行请输出 ```local_cmd 代码块，若全部完成请给出最终解答。";
+                // Echo the originating call so the planner can tell which command an
+                // output belongs to even when several turns are interleaved.
+                string echoLine = string.IsNullOrEmpty(cmdEcho) ? "" : "CMD: " + cmdEcho + "\n";
+                feedbackPrompt = $"[Tool Call Result (Exit: {exitCode})]:\n{echoLine}```\n{output}\n```\n请根据上述终端执行结果继续。若需继续执行请输出 ```local_cmd 代码块，若全部完成请给出最终解答。";
             }
 
             return await _apiClient.SendCompletionDirectAsync(sessionId, parentMsgId, feedbackPrompt, refFileIds, token);
