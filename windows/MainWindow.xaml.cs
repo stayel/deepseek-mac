@@ -85,7 +85,7 @@ namespace DeepSeek
                     using var init = System.Management.Automation.PowerShell.Create();
                     init.Runspace = rs;
                     Func<string, string> q = s => "'" + s.Replace("'", "''") + "'";
-                    init.AddScript($"Set-Location -LiteralPath {q(workingDir)}; $env:PATH = {q(localBin)} + ';' + {q(programsBin)} + ';' + $env:PATH");
+                    init.AddScript($"Set-Location -LiteralPath {q(workingDir)}; $env:PATH = {q(localBin)} + ';' + {q(programsBin)} + ';' + $env:PATH; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;");
                     init.Invoke();
                     init.Streams.ClearStreams();
                 }
@@ -906,7 +906,7 @@ namespace DeepSeek
 
                 using var ps = System.Management.Automation.PowerShell.Create();
                 ps.Runspace = runspace;
-                ps.AddScript("$ProgressPreference='SilentlyContinue'; " + command);
+                ps.AddScript("$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; " + command);
                 // Live tap BEFORE Out-String: Write-LiveStream forwards each object's
                 // text immediately (Out-String would buffer until upstream completes).
                 ps.AddCommand("Write-LiveStream");

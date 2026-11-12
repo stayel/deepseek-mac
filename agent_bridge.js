@@ -144,7 +144,7 @@
                         // Human-readable wait state (throttled to 1s changes)
                         // so long irregular gaps don't look like a hang.
                         let waitMs = 0, label = '';
-                        if (!fuseOk) { waitMs = fuseUntil - Date.now(); label = '连续工作' + FUSE_MAX_STREAK + '轮，休息中…约'; }
+                        if (!fuseOk) { waitMs = fuseUntil - Date.now(); label = '连续工作' + FUSE_MAX_STREAK + '轮休息中(点击切换按钮可跳过)…约'; }
                         else if (!coolOk) { waitMs = rateLimitBackoffUntil - Date.now(); label = '限流冷却中…约'; }
                         else if (!gapOk) { waitMs = (lastAutoSendAt + nextSendGapMs) - Date.now(); label = '思考中…约'; }
                         if (waitMs > 0) {
@@ -380,7 +380,17 @@
     }
     // Monotonic per-dispatch id: stamped on the card AND echoed in the feedback,
     // so any result can be traced back to the command that produced it.
-    let dispatchSeq = 0;
+    const SEQ_STORAGE_KEY = 'ds_agent_dispatch_seq_v1';
+    function loadDispatchSeq() {
+        try {
+            const val = parseInt(sessionStorage.getItem(SEQ_STORAGE_KEY), 10);
+            return (!isNaN(val) && val > 0) ? val : 0;
+        } catch (_) { return 0; }
+    }
+    function saveDispatchSeq(seq) {
+        try { sessionStorage.setItem(SEQ_STORAGE_KEY, String(seq)); } catch (_) {}
+    }
+    let dispatchSeq = loadDispatchSeq();
     let inflight = null;   // { id, seq, kind, target, cmdHead, startedAt }
 
     // Direct-loop virtual queue: replies arriving out-of-band are scanned here
@@ -506,6 +516,7 @@
         document.body.appendChild(hud);
 
         document.getElementById('agent-inject-btn').addEventListener('click', () => {
+            try { totalSessionSends = 0; fuseUntil = 0; autoSendStreak = 0; rateLimitHits = 0; lastGapHudSec = -1; dispatchSeq = 0; saveDispatchSeq(0); } catch (_) {}
             injectPrompt(SYSTEM_PROMPT, true);
         });
 
@@ -957,6 +968,8 @@
     // 3. Scanner with Debounce & Quote Verification
     function scanAndProcessToolCalls() {
         if (isExecutingNow) return;
+        // Defense against mid-generation truncation: NEVER scan or dispatch while the model is still streaming!
+        if (isGenerating()) return;
 
         settleTick();
 
@@ -964,27 +977,32 @@
         const now = Date.now();
 
         // Scope whitelist: only blocks inside the LATEST message-like container
-        // may start a call. Walk from the end and take the first container that
-        // holds code but is neither our feedback (marker) nor our own UI nor the
-        // composer (no code). Bare "last container" misfires when the composer
-        // or our own bubbles sort after the model message.
-        // Falls back to unscoped when the site DOM matches nothing.
+        // may start a call. Walk from the end and locate the latest non-feedback container.
+        // CRUCIAL: Once the latest assistant message is found, we evaluate ONLY that message.
+        // We NEVER backtrack into older historical messages to prevent re-executing stale commands.
         let scanScope = null;
         try {
             const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id]');
-            for (let i = containers.length - 1; i >= 0; i--) {
-                const c = containers[i];
-                let t = '';
-                try { t = c.textContent || ''; } catch (_) {}
-                if (t.includes('[Tool Call')) continue;
-                let hasCode = false, ownUi = false;
-                try {
-                    hasCode = !!c.querySelector('pre, code');
-                    ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
-                } catch (_) {}
-                if (ownUi || !hasCode) continue;
-                scanScope = c;
-                break;
+            if (containers.length > 0) {
+                for (let i = containers.length - 1; i >= 0; i--) {
+                    const c = containers[i];
+                    let t = '';
+                    try { t = c.textContent || ''; } catch (_) {}
+                    if (t.includes('[Tool Call')) continue;
+                    // Located the single latest assistant container:
+                    let hasCode = false, ownUi = false;
+                    try {
+                        hasCode = !!c.querySelector('pre, code');
+                        ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
+                    } catch (_) {}
+                    if (hasCode && !ownUi) {
+                        scanScope = c;
+                    }
+                    // Crucial: ALWAYS stop at the latest assistant message; never backtrack into older turns!
+                    break;
+                }
+                // If containers exist and the latest message has no unprocessed code, stop scanning.
+                if (!scanScope) return;
             }
         } catch (_) {}
 
@@ -1156,6 +1174,7 @@
         lastDispatch = { cmd: normCmd, at: nowMs };
 
         dispatchSeq++;
+        saveDispatchSeq(dispatchSeq);
         controller.setSeq(dispatchSeq);
         controller.cmdHead = normCmd.slice(0, 120);
         controller.target = '';
@@ -1205,6 +1224,7 @@
         lastDispatch = { cmd: sig, at: nowMs };
 
         dispatchSeq++;
+        saveDispatchSeq(dispatchSeq);
         controller.setSeq(dispatchSeq);
         controller.target = path;
         controller.cmdHead = 'write_file ' + path;
@@ -1540,8 +1560,9 @@
                             hasCode = !!c.querySelector('pre, code');
                             ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
                         } catch (_) {}
-                        if (ownUi || !hasCode) continue;
-                        scopeIdx = i;
+                        if (hasCode && !ownUi) {
+                            scopeIdx = i;
+                        }
                         break;
                     }
                     const tail = blocks.slice(-4).map((el, k) => {
@@ -1617,7 +1638,7 @@
         injectSystemPrompt: function() {
             // Fresh protocol injection ≈ fresh session intent: restart the
             // session-length counter (and clear fuse/strikes, see toggle).
-            try { totalSessionSends = 0; fuseUntil = 0; autoSendStreak = 0; rateLimitHits = 0; lastGapHudSec = -1; } catch (_) {}
+            try { totalSessionSends = 0; fuseUntil = 0; autoSendStreak = 0; rateLimitHits = 0; lastGapHudSec = -1; dispatchSeq = 0; saveDispatchSeq(0); } catch (_) {}
             injectPrompt(SYSTEM_PROMPT, true);
         },
         dumpConversation: function() {
