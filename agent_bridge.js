@@ -509,6 +509,7 @@
         document.body.appendChild(hud);
 
         document.getElementById('agent-inject-btn').addEventListener('click', () => {
+            generationObserved = true;
             try { totalSessionSends = 0; fuseUntil = 0; autoSendStreak = 0; rateLimitHits = 0; lastGapHudSec = -1; dispatchSeq = 0; saveDispatchSeq(0); } catch (_) {}
             injectPrompt(SYSTEM_PROMPT, true);
         });
@@ -958,15 +959,89 @@
         return controller;
     }
 
+    // Active turn guard: prevents historical blocks from auto-firing when opening old sessions.
+    // Initialized to false on startup and reset to false whenever the conversation URL changes.
+    let generationObserved = false;
+    let currentSessionUrl = typeof location !== 'undefined' ? location.href : '';
+
+    function onSessionUrlChanged() {
+        if (typeof location === 'undefined') return;
+        if (location.href === currentSessionUrl) return;
+        currentSessionUrl = location.href;
+        generationObserved = false;
+        baselineDone = false;
+        settleCount = -1;
+        settleChangedAt = Date.now();
+        settleStable = 0;
+        settleAnchor = null;
+        lastAckedContainer = null;
+        try { console.log('[Agent Bridge] Session URL changed to: ' + currentSessionUrl + ' (history guard armed)'); } catch (_) {}
+    }
+
+    if (typeof window !== 'undefined') {
+        window.addEventListener('popstate', onSessionUrlChanged);
+        try {
+            const _origPush = history.pushState;
+            if (_origPush) {
+                history.pushState = function() {
+                    const res = _origPush.apply(this, arguments);
+                    onSessionUrlChanged();
+                    return res;
+                };
+            }
+            const _origReplace = history.replaceState;
+            if (_origReplace) {
+                history.replaceState = function() {
+                    const res = _origReplace.apply(this, arguments);
+                    onSessionUrlChanged();
+                    return res;
+                };
+            }
+        } catch (_) {}
+
+        // Track user typing send and send button clicks
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                const ta = findInputTextarea();
+                if (ta && (e.target === ta || ta.contains(e.target))) {
+                    generationObserved = true;
+                }
+            }
+        }, true);
+        window.addEventListener('click', (e) => {
+            const btn = findSendButton();
+            if (btn && (e.target === btn || btn.contains(e.target))) {
+                generationObserved = true;
+            }
+        }, true);
+    }
+
     // 3. Scanner with Debounce & Quote Verification
     function scanAndProcessToolCalls() {
         if (isExecutingNow) return;
+        onSessionUrlChanged();
+
         // Defense against mid-generation truncation: NEVER scan or dispatch while the model is still streaming!
-        if (isGenerating()) return;
+        if (isGenerating()) {
+            generationObserved = true;
+            return;
+        }
 
         settleTick();
 
         const blocks = document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block');
+
+        // Active turn guard: if no new user prompt or model generation was initiated in this session,
+        // all existing blocks are strictly static history. Mark them as processed and NEVER auto-execute!
+        if (!generationObserved) {
+            for (let el of blocks) {
+                processedBlocks.add(el);
+                const parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el;
+                processedBlocks.add(parent);
+            }
+            return;
+        }
+
         const now = Date.now();
 
         // Scope whitelist: only blocks inside the LATEST message-like container
@@ -1631,6 +1706,7 @@
         injectSystemPrompt: function() {
             // Fresh protocol injection ≈ fresh session intent: restart the
             // session-length counter (and clear fuse/strikes, see toggle).
+            generationObserved = true;
             try { totalSessionSends = 0; fuseUntil = 0; autoSendStreak = 0; rateLimitHits = 0; lastGapHudSec = -1; dispatchSeq = 0; saveDispatchSeq(0); } catch (_) {}
             injectPrompt(SYSTEM_PROMPT, true);
         },
@@ -2081,6 +2157,7 @@ ${output}
     }
 
     function triggerSend() {
+        generationObserved = true;
         try { lastAutoSendAt = Date.now(); } catch (_) {}
         const textarea = findInputTextarea();
         if (!textarea) return false;
@@ -2150,6 +2227,7 @@ ${output}
     }
 
     function injectPrompt(text, autoSend = false) {
+        if (autoSend) generationObserved = true;
         const textarea = findInputTextarea();
         if (!textarea) {
             console.error("[Agent Bridge] Textarea not found!");
